@@ -7,7 +7,7 @@ Give it a photo of your track -> outputs speed profile for Arduino.
 Optionally sends that profile straight to the Arduino over USB serial.
 
 INSTALL (run once):
-    pip install opencv-python numpy pyserial scikit-image
+    pip install opencv-python numpy pyserial
 
 RUN (analyze only):
     python track_analyzer.py photo_of_track.jpg
@@ -60,6 +60,10 @@ SPEED_SHARP     = 105       # must match baseSpeed3
 MIN_SEGMENT_PCT = 3.0       # ignore/merge segments shorter than this % of total path
 SMOOTH_WINDOW   = 20        # moving-average window for path smoothing
 
+MAX_DIMENSION   = 1600      # phone photos get downscaled to this max width/height
+                             # before processing (keeps thinning fast; raise if
+                             # you need finer detail on a very long/thin track)
+
 SERIAL_BAUD     = 115200    # must match Serial.begin() on the Arduino
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,6 +80,11 @@ def load_image(path):
         sys.exit(1)
     h, w = img.shape[:2]
     print(f"Loaded: {w}x{h} px")
+    longest = max(h, w)
+    if longest > MAX_DIMENSION:
+        scale = MAX_DIMENSION / longest
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        print(f"Resized to: {img.shape[1]}x{img.shape[0]} px (kept under {MAX_DIMENSION}px)")
     return img
 
 
@@ -94,20 +103,66 @@ def extract_mask(img):
     return cleaned
 
 
+def _zhang_suen_thin(img01):
+    """
+    Pure NumPy Zhang-Suen thinning (no scipy/scikit-image dependency).
+    img01: 2D array of 0/1 (uint8). Returns thinned 0/1 array, same shape.
+    scikit-image was removed because it pulls in scipy, which does not
+    reliably cross-compile for Android in buildozer/python-for-android —
+    that was the actual cause of the Android build failures, not the SDK
+    license. This function is self-contained and only needs numpy.
+    """
+    img = img01.astype(np.uint8).copy()
+    changed = True
+    while changed:
+        changed = False
+        for step in (1, 2):
+            padded = np.pad(img, 1, mode="constant")
+            P1 = padded[1:-1, 1:-1]
+            P2 = padded[0:-2, 1:-1]
+            P3 = padded[0:-2, 2:]
+            P4 = padded[1:-1, 2:]
+            P5 = padded[2:, 2:]
+            P6 = padded[2:, 1:-1]
+            P7 = padded[2:, 0:-2]
+            P8 = padded[1:-1, 0:-2]
+            P9 = padded[0:-2, 0:-2]
+
+            B = P2 + P3 + P4 + P5 + P6 + P7 + P8 + P9
+            A = (((P2 == 0) & (P3 == 1)).astype(np.uint8)
+                 + ((P3 == 0) & (P4 == 1)).astype(np.uint8)
+                 + ((P4 == 0) & (P5 == 1)).astype(np.uint8)
+                 + ((P5 == 0) & (P6 == 1)).astype(np.uint8)
+                 + ((P6 == 0) & (P7 == 1)).astype(np.uint8)
+                 + ((P7 == 0) & (P8 == 1)).astype(np.uint8)
+                 + ((P8 == 0) & (P9 == 1)).astype(np.uint8)
+                 + ((P9 == 0) & (P2 == 1)).astype(np.uint8))
+
+            if step == 1:
+                cond_c = (P2 * P4 * P6) == 0
+                cond_d = (P4 * P6 * P8) == 0
+            else:
+                cond_c = (P2 * P4 * P8) == 0
+                cond_d = (P2 * P6 * P8) == 0
+
+            marks = (P1 == 1) & (B >= 2) & (B <= 6) & (A == 1) & cond_c & cond_d
+            if marks.any():
+                img[marks] = 0
+                changed = True
+    return img
+
+
 def skeletonize(mask):
     """
-    Thin the line mask to a 1-pixel-wide centerline.
-
-    Uses skimage's Zhang-Suen thinning, which preserves connectivity of the
-    input blob. A manual erode/dilate loop was tried first but reliably
-    fragments curved lines into dozens of disconnected pieces, breaking the
-    path tracer — confirmed with cv2.connectedComponents on a test image
-    (20 separate fragments from a single continuous line). Thinning avoids
-    that failure mode entirely.
+    Thin the line mask to a 1-pixel-wide centerline, using Zhang-Suen
+    thinning (pure NumPy — see _zhang_suen_thin). This preserves
+    connectivity of the input blob, unlike a naive erode/dilate loop,
+    which was tried first and reliably fragments curved lines into dozens
+    of disconnected pieces (confirmed with cv2.connectedComponents on a
+    test image: 20 separate fragments from one continuous line).
     """
-    from skimage.morphology import skeletonize as sk_skeletonize
-    skel_bool = sk_skeletonize(mask > 0)
-    skel = (skel_bool.astype(np.uint8)) * 255
+    thin01 = _zhang_suen_thin((mask > 0).astype(np.uint8))
+    skel = thin01 * 255
     print(f"Skeleton: {cv2.countNonZero(skel)} pixels")
     n_components, _ = cv2.connectedComponents(skel, connectivity=8)
     if n_components - 1 > 1:
