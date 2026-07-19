@@ -6,7 +6,7 @@ source.dir = .
 source.include_exts = py,png,jpg,jpeg,kv,atlas
 version = 0.1
 
-requirements = python3,kivy==2.3.0,opencv,numpy,plyer,usb4a,usbserial4a,pyjnius
+requirements = python3,kivy==2.3.0,opencv,numpy==1.26.4,plyer,usb4a,usbserial4a,pyjnius
 
 orientation = portrait
 fullscreen = 0
